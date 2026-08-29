@@ -1,0 +1,276 @@
+name: Full Deploy - Infra + Build + Deploy
+
+# One trigger does everything: create/update AWS infra with Terraform,
+# build the WAR, build+push a Docker image, then deploy the WAR onto
+# whatever server Terraform just reported — no manual steps, no
+# copy/pasting IPs between jobs or secrets.
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. INFRA — creates/updates the VPC, EC2 app server, and RDS via
+  #    Terraform. Its output (the server's IP) feeds directly into the
+  #    deploy job below as a job output, nothing goes through secrets.
+  # ------------------------------------------------------------------
+  infra:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      bastion_ip: ${{ steps.tf_outputs.outputs.bastion_ip }}
+      app_private_ip: ${{ steps.tf_outputs.outputs.app_private_ip }}
+      alb_dns_name: ${{ steps.tf_outputs.outputs.alb_dns_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.USE_OIDC == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Configure AWS credentials (access keys)
+        if: ${{ vars.USE_OIDC != 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Ensure Terraform state bucket exists
+        id: state_bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGION="${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}"
+          BUCKET="tfstate-skillexchange-${ACCOUNT_ID}"
+
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket $BUCKET already exists."
+          else
+            echo "Creating state bucket $BUCKET in $REGION..."
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket "$BUCKET" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.state_bucket.outputs.bucket }}" \
+            -backend-config="key=skillexchange/terraform.tfstate" \
+            -backend-config="region=${{ steps.state_bucket.outputs.region }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      - name: Read outputs
+        id: tf_outputs
+        run: |
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "app_private_ip=$(terraform output -raw app_private_ip)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # 2. BUILD — compiles the WAR. Runs only after infra succeeds, so the
+  #    whole pipeline is strictly sequential: infra -> build -> docker
+  #    -> deploy, one at a time, in that order.
+  # ------------------------------------------------------------------
+  build:
+    name: Build WAR
+    needs: infra
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn -B clean package
+
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-war
+          path: target/SkillExchangeProject.war
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 3. DOCKER — versioned image pushed to GHCR (backup / portable copy,
+  #    not required for the EC2 deploy path below). Runs after build.
+  # ------------------------------------------------------------------
+  docker:
+    name: Build & Push Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-war
+          path: target
+
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.image.outputs.name }}:latest
+            ghcr.io/${{ steps.image.outputs.name }}:${{ github.sha }}
+
+  # ------------------------------------------------------------------
+  # 4. DEPLOY - runs last, after docker. Hops through the bastion (the
+  #    only SSH entry point) to reach the private app server, ships the
+  #    WAR, restarts Tomcat, health-checks it via the ALB, and rolls
+  #    back on failure.
+  # ------------------------------------------------------------------
+  deploy:
+    name: Deploy via Bastion (SSH)
+    needs: [infra, build, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-war
+          path: target
+
+      - name: Configure AWS credentials
+        if: ${{ vars.USE_OIDC == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Configure AWS credentials (access keys)
+        if: ${{ vars.USE_OIDC != 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # The SSH key was generated by Terraform and lives only in SSM
+      # Parameter Store - fetched here using the AWS creds above, never
+      # a GitHub secret, never committed.
+      - name: Fetch deploy SSH key from SSM Parameter Store
+        run: |
+          aws ssm get-parameter --name "/skillexchange/deploy-ssh-key" --with-decryption \
+            --query "Parameter.Value" --output text > deploy_key.pem
+          chmod 600 deploy_key.pem
+
+      - name: Wait for bastion and app instance to be reachable over SSH
+        run: |
+          BASTION_IP="${{ needs.infra.outputs.bastion_ip }}"
+          APP_IP="${{ needs.infra.outputs.app_private_ip }}"
+          PROXY="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i deploy_key.pem -W %h:%p ec2-user@$BASTION_IP"
+
+          echo "Waiting for bastion SSH..."
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+              -i deploy_key.pem ec2-user@"$BASTION_IP" "echo ok" 2>/dev/null && break
+            echo "  not ready yet ($i/30), retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Waiting for app instance SSH (through bastion)..."
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+              -o "ProxyCommand=$PROXY" -i deploy_key.pem ec2-user@"$APP_IP" "echo ok" 2>/dev/null && break
+            echo "  not ready yet ($i/30), retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Wait for the bootstrap script to finish (Java/Tomcat/Nginx install)
+        run: |
+          BASTION_IP="${{ needs.infra.outputs.bastion_ip }}"
+          APP_IP="${{ needs.infra.outputs.app_private_ip }}"
+          PROXY="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i deploy_key.pem -W %h:%p ec2-user@$BASTION_IP"
+
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o "ProxyCommand=$PROXY" \
+            -i deploy_key.pem ec2-user@"$APP_IP" \
+            'for i in $(seq 1 60); do test -f /opt/deploy.sh && echo BOOTSTRAP_OK && exit 0; sleep 10; done; echo BOOTSTRAP_TIMEOUT; sudo tail -n 150 /var/log/cloud-init-output.log; exit 1'
+
+      - name: Copy WAR to app instance through the bastion
+        run: |
+          BASTION_IP="${{ needs.infra.outputs.bastion_ip }}"
+          APP_IP="${{ needs.infra.outputs.app_private_ip }}"
+          PROXY="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i deploy_key.pem -W %h:%p ec2-user@$BASTION_IP"
+
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o "ProxyCommand=$PROXY" \
+            -i deploy_key.pem target/SkillExchangeProject.war ec2-user@"$APP_IP":/tmp/SkillExchangeProject.war
+
+      - name: Run deploy script on the app instance
+        run: |
+          BASTION_IP="${{ needs.infra.outputs.bastion_ip }}"
+          APP_IP="${{ needs.infra.outputs.app_private_ip }}"
+          PROXY="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i deploy_key.pem -W %h:%p ec2-user@$BASTION_IP"
+
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o "ProxyCommand=$PROXY" \
+            -i deploy_key.pem ec2-user@"$APP_IP" "sudo /opt/deploy.sh"
+
+      - name: Health check via the load balancer
+        run: |
+          sleep 10
+          ALB_DNS="${{ needs.infra.outputs.alb_dns_name }}"
+          curl -sf -o /dev/null "http://$ALB_DNS/" && echo "✅ Site is live at http://$ALB_DNS/" || (echo "❌ Site did not respond" && exit 1)
+
+      - name: Clean up local SSH key
+        if: always()
+        run: rm -f deploy_key.pem
