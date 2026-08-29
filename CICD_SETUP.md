@@ -122,3 +122,97 @@ and the pipeline also rolls back automatically if a deploy's health check fails.
   has this repo added under "Manage Actions access" with Write role.
 
 See `terraform/README.md` for infra-specific details.
+
+---
+
+## Reference: how this would scale to a production, multi-region setup
+
+**This section describes a target architecture, not what's currently
+deployed.** The project as built runs the single-region setup documented
+above — one app server, one bastion, one ALB, one RDS instance. What
+follows is the standard AWS pattern this project would grow into for a
+real production workload with high-availability and disaster-recovery
+requirements, useful as a "how would you scale this" answer but not a
+claim about the running infrastructure.
+
+```mermaid
+flowchart TB
+    Client([Client])
+    R53["Amazon Route 53<br/>DNS + health-check failover"]
+    WAF["AWS WAF"]
+    CF["Amazon CloudFront<br/>CDN"]
+
+    Client --> R53 --> WAF --> CF
+
+    subgraph Active["Region: us-east-1 — ACTIVE"]
+        direction TB
+        ELB1["Elastic Load Balancer"]
+        subgraph AZ1a["AZ us-east-1a"]
+            Bastion1["Bastion host"]
+            Web1a["Web tier<br/>Auto Scaling Group"]
+            App1a["App tier<br/>Auto Scaling Group"]
+            RDS1a[("RDS — Primary")]
+        end
+        subgraph AZ1b["AZ us-east-1b"]
+            Web1b["Web tier<br/>Auto Scaling Group"]
+            App1b["App tier<br/>Auto Scaling Group"]
+            RDS1b[("RDS — Standby<br/>(Multi-AZ)")]
+        end
+        Backup1["AWS Backup Vault"]
+    end
+
+    subgraph Standby["Region: us-west-2 — WARM STANDBY (DR)"]
+        direction TB
+        ELB2["Elastic Load Balancer<br/>(idle — no production traffic)"]
+        subgraph AZ2a["AZ us-west-2a"]
+            Bastion2["Bastion host"]
+            Web2a["Web tier<br/>Auto Scaling Group"]
+            App2a["App tier<br/>Auto Scaling Group"]
+            RDS2a[("RDS — Read Replica")]
+        end
+        subgraph AZ2b["AZ us-west-2b"]
+            Web2b["Web tier<br/>Auto Scaling Group"]
+            App2b["App tier<br/>Auto Scaling Group"]
+            RDS2b[("RDS — Read Replica")]
+        end
+        Backup2["AWS Backup Vault"]
+    end
+
+    CF -- "active" --> ELB1
+    CF -. "failover only" .-> ELB2
+
+    ELB1 --> Web1a & Web1b
+    Web1a --> App1a
+    Web1b --> App1b
+    App1a --> RDS1a
+    App1b --> RDS1b
+    RDS1a -- "sync" --> RDS1b
+
+    ELB2 --> Web2a & Web2b
+    Web2a --> App2a
+    Web2b --> App2b
+
+    RDS1a -. "cross-region<br/>read replica" .-> RDS2a
+    RDS2a -- "sync" --> RDS2b
+
+    Backup1 -. "cross-region backup" .-> Backup2
+```
+
+### What changes at each step, and why
+
+| Current (this project) | Production evolution | Why it's added |
+|---|---|---|
+| Single EC2 app server | Auto Scaling Group across 2+ AZs, both web tier (Nginx) and app tier (Tomcat) split into their own ASGs | Survives an instance or AZ failure; scales with real traffic instead of a fixed-size box |
+| Single ALB, single region | ALB per region + Route 53 with health-check-based failover | Removes the region itself as a single point of failure |
+| No CDN | CloudFront in front of the ALB | Caches static assets at the edge, cuts latency globally, absorbs traffic spikes |
+| No WAF | AWS WAF in front of CloudFront | Blocks common web attacks (SQLi, XSS, bot traffic) before they reach the app |
+| Single RDS instance | Multi-AZ RDS (synchronous standby) + cross-region read replica | Multi-AZ gives automatic failover within the region; the cross-region replica is the seed for the DR region if the primary region goes down entirely |
+| No backup automation | AWS Backup with a cross-region backup vault | Point-in-time recovery that survives losing an entire region, not just an instance |
+| One bastion | One bastion per region | DR region needs its own operational access path too |
+
+**What stays the same:** the core security posture — app servers with no
+public IP, database never internet-reachable, SSH only through a bastion,
+HTTP only through a load balancer — applies at every scale. This project
+already implements that pattern; the production version just repeats it
+across more AZs and a second region, and adds the edge/WAF/CDN layer in
+front of it.
